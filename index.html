@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Record Capture</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;background:#1b1b1b;color:#fff}
+header{background:#7a1f1f;padding:10px 14px;text-align:center}
+header h1{margin:0;font-size:18px}
+.stats{display:flex;gap:8px;padding:10px}
+.stat{flex:1;background:#2c2c2c;border-radius:8px;padding:8px;text-align:center}
+.stat b{display:block;font-size:26px}
+.stat span{font-size:12px;color:#bbb}
+.warn b{color:#ff6b6b}
+#video{width:100%;max-height:42vh;background:#000;object-fit:cover}
+.panel{padding:10px}
+label{font-size:13px;color:#ccc;display:block;margin-top:8px}
+select{width:100%;padding:10px;font-size:16px;border-radius:6px}
+button{width:100%;padding:14px;margin-top:10px;font-size:17px;border:0;border-radius:8px;color:#fff;background:#2e7d32}
+button.secondary{background:#444}
+button.export{background:#1565c0}
+button.danger{background:#8a2c2c}
+button:disabled{background:#555;color:#999}
+#step{font-size:18px;text-align:center;margin:8px 0;font-weight:bold}
+#msg{text-align:center;color:#ffd54f;min-height:20px}
+.thumbs{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.thumbs img{width:56px;height:56px;object-fit:cover;border-radius:4px}
+</style>
+</head>
+<body>
+<header><h1>Record Capture</h1></header>
+
+<div class="stats">
+  <div class="stat"><b id="recNo">1</b><span>Current record</span></div>
+  <div class="stat" id="photoBox"><b id="photoCount">0</b><span>Photos in batch (max <span id="maxShow">40</span>)</span></div>
+  <div class="stat"><b id="recBatch">0</b><span>Records in batch</span></div>
+</div>
+
+<video id="video" autoplay playsinline muted></video>
+
+<div class="panel">
+  <div id="step">Tap Start Camera</div>
+  <div id="msg"></div>
+
+  <button id="camBtn" class="secondary">Start Camera</button>
+
+  <div id="setup">
+    <label>Interior photos needed for this record</label>
+    <select id="interiorNeeded">
+      <option value="no">No</option>
+      <option value="yes">Yes</option>
+    </select>
+    <div id="interiorCountWrap" style="display:none">
+      <label>How many interior photos</label>
+      <select id="interiorCount">
+        <option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option>
+      </select>
+    </div>
+    <button id="beginBtn" disabled>Begin This Record</button>
+  </div>
+
+  <button id="snapBtn" style="display:none">Take Photo</button>
+  <button id="undoBtn" class="secondary" style="display:none">Undo Last Photo</button>
+
+  <button id="exportBtn" class="export" disabled>Export Zip (0 photos)</button>
+  <button id="nextBtn" style="display:none">Start Pictures Again (next batch)</button>
+
+  <label>Maximum photos per batch</label>
+  <select id="maxSel">
+    <option>20</option><option>30</option><option selected>40</option><option>50</option><option>60</option>
+  </select>
+
+  <div class="thumbs" id="thumbs"></div>
+</div>
+
+<canvas id="canvas" style="display:none"></canvas>
+
+<script>
+let stream=null;
+let nextRecord=parseInt(localStorage.getItem('nextRecord')||'1',10);
+let photos=[];            // {name, blob}
+let recordsInBatch=0;
+let plan=[];              // steps for current record
+let planIdx=0;
+let currentRecord=nextRecord;
+let exported=true;
+let locked=false;
+
+const $=id=>document.getElementById(id);
+const video=$('video'), canvas=$('canvas');
+
+function maxPhotos(){return parseInt($('maxSel').value,10)}
+
+function pad(n){return String(n).padStart(3,'0')}
+
+function refresh(){
+  $('recNo').textContent=currentRecord;
+  $('photoCount').textContent=photos.length;
+  $('maxShow').textContent=maxPhotos();
+  $('recBatch').textContent=recordsInBatch;
+  $('exportBtn').textContent='Export Zip ('+photos.length+' photos)';
+  $('exportBtn').disabled=photos.length===0;
+  $('photoBox').classList.toggle('warn',photos.length>=maxPhotos()-5);
+  $('undoBtn').style.display=(photos.length>0&&plan.length>0)?'block':'none';
+}
+
+$('interiorNeeded').onchange=()=>{
+  $('interiorCountWrap').style.display=$('interiorNeeded').value==='yes'?'block':'none';
+};
+
+$('camBtn').onclick=async()=>{
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false});
+    video.srcObject=stream;
+    $('camBtn').style.display='none';
+    $('beginBtn').disabled=false;
+    $('step').textContent='Camera ready. Set up the record.';
+  }catch(e){
+    $('msg').textContent='Camera blocked or unavailable. Check browser permissions.';
+  }
+};
+
+function buildPlan(){
+  plan=['front','back'];
+  if($('interiorNeeded').value==='yes'){
+    const n=parseInt($('interiorCount').value,10);
+    for(let i=1;i<=n;i++)plan.push('interior'+i);
+  }
+}
+
+$('beginBtn').onclick=()=>{
+  if(locked){return}
+  buildPlan();
+  if(photos.length+plan.length>maxPhotos()){
+    $('msg').textContent='This record would go over the limit. Please export first.';
+    lockForExport();
+    return;
+  }
+  planIdx=0;
+  $('setup').style.display='none';
+  $('snapBtn').style.display='block';
+  $('msg').textContent='';
+  showStep();
+  refresh();
+};
+
+function showStep(){
+  const label=plan[planIdx];
+  const pretty=label.startsWith('interior')?'Interior '+label.replace('interior',''):label.charAt(0).toUpperCase()+label.slice(1);
+  $('step').textContent='Record '+currentRecord+': '+pretty+' ('+(planIdx+1)+' of '+plan.length+')';
+  $('snapBtn').textContent='Take Photo: '+pretty;
+}
+
+$('snapBtn').onclick=()=>{
+  if(!stream)return;
+  canvas.width=video.videoWidth;
+  canvas.height=video.videoHeight;
+  canvas.getContext('2d').drawImage(video,0,0);
+  canvas.toBlob(blob=>{
+    const name='record_'+pad(currentRecord)+'_'+plan[planIdx]+'.jpg';
+    photos.push({name,blob});
+    exported=false;
+    addThumb(blob);
+    planIdx++;
+    if(planIdx>=plan.length){finishRecord()}else{showStep()}
+    refresh();
+  },'image/jpeg',0.85);
+};
+
+function addThumb(blob){
+  const img=document.createElement('img');
+  img.src=URL.createObjectURL(blob);
+  $('thumbs').appendChild(img);
+}
+
+function finishRecord(){
+  recordsInBatch++;
+  currentRecord++;
+  plan=[];
+  $('snapBtn').style.display='none';
+  // Lock if even a minimal next record (front and back) could not fit
+  if(photos.length+2>maxPhotos()){
+    lockForExport();
+  }else{
+    $('setup').style.display='block';
+    $('interiorNeeded').value='no';
+    $('interiorCountWrap').style.display='none';
+    $('step').textContent='Record '+currentRecord+': set up';
+  }
+}
+
+function lockForExport(){
+  locked=true;
+  $('setup').style.display='none';
+  $('snapBtn').style.display='none';
+  $('step').textContent='Batch full. Please export photos so far.';
+  refresh();
+}
+
+$('undoBtn').onclick=()=>{
+  if(photos.length===0||plan.length===0||planIdx===0)return;
+  photos.pop();
+  planIdx--;
+  const t=$('thumbs');
+  if(t.lastChild)t.removeChild(t.lastChild);
+  showStep();
+  refresh();
+};
+
+$('exportBtn').onclick=async()=>{
+  if(photos.length===0)return;
+  // If a record is half-finished, warn
+  if(plan.length>0&&planIdx>0&&planIdx<plan.length){
+    if(!confirm('The current record is only part-photographed. Export anyway?'))return;
+  }
+  $('msg').textContent='Building zip...';
+  const zip=new JSZip();
+  photos.forEach(p=>zip.file(p.name,p.blob));
+  const first=photos[0].name.match(/record_(\d+)/)[1];
+  const last=photos[photos.length-1].name.match(/record_(\d+)/)[1];
+  const content=await zip.generateAsync({type:'blob'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(content);
+  a.download='records_'+first+'_to_'+last+'.zip';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  exported=true;
+  localStorage.setItem('nextRecord',String(currentRecord));
+  $('msg').textContent='Zip saved to your downloads. Check it before starting the next batch.';
+  $('exportBtn').disabled=true;
+  $('nextBtn').style.display='block';
+  $('setup').style.display='none';
+  $('snapBtn').style.display='none';
+  $('step').textContent='Exported. Press Start Pictures Again.';
+};
+
+$('nextBtn').onclick=()=>{
+  photos=[];
+  recordsInBatch=0;
+  plan=[];
+  planIdx=0;
+  locked=false;
+  $('thumbs').innerHTML='';
+  $('nextBtn').style.display='none';
+  $('setup').style.display='block';
+  $('msg').textContent='';
+  $('step').textContent='Record '+currentRecord+': set up';
+  refresh();
+};
+
+$('maxSel').onchange=refresh;
+
+window.addEventListener('beforeunload',e=>{
+  if(!exported&&photos.length>0){e.preventDefault();e.returnValue=''}
+});
+
+refresh();
+</script>
+</body>
+</html>
